@@ -3,9 +3,10 @@
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
-#include <conio.h>
-#include <windows.h>
+#include <termios.h>
+#include <sys/select.h>
 #include <time.h>
+#include <unistd.h>
 
 #define MAP_W 50
 #define MAP_H 20
@@ -57,8 +58,23 @@ static Minion gMinions[MAX_MINIONS];
 static Tower gTowers[2];
 static int gRunning = 1;
 static int gTick = 0;
-static HANDLE gConsole;
 pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
+static struct termios gOrigTermios;
+
+static void restoreTerminal(void) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &gOrigTermios);
+}
+
+static void enableRawInput(void) {
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &gOrigTermios);
+    raw = gOrigTermios;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    atexit(restoreTerminal);
+}
 
 static void initMap(void) {
     for (int y = 0; y < MAP_H; ++y) {
@@ -314,8 +330,7 @@ static int checkVictory(void) {
 }
 
 static void renderFrame(void) {
-    COORD pos = {0, 0};
-    SetConsoleCursorPosition(gConsole, pos);
+    printf("\033[H");
     char buffer[MAP_H][MAP_W + 1];
     for (int y = 0; y < MAP_H; ++y) {
         memcpy(buffer[y], gMap[y], MAP_W + 1);
@@ -344,7 +359,21 @@ static void renderFrame(void) {
 static void *inputThread(void *arg) {
     (void)arg;
     while (1) {
-        int ch = _getch();
+        fd_set set;
+        struct timeval tv;
+        FD_ZERO(&set);
+        FD_SET(STDIN_FILENO, &set);
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms
+        int ready = select(STDIN_FILENO + 1, &set, NULL, NULL, &tv);
+        if (ready <= 0) {
+            pthread_mutex_lock(&gStateMutex);
+            int stillRunning = gRunning;
+            pthread_mutex_unlock(&gStateMutex);
+            if (!stillRunning) break;
+            continue;
+        }
+        int ch = getchar();
         pthread_mutex_lock(&gStateMutex);
         if (!gRunning) {
             pthread_mutex_unlock(&gStateMutex);
@@ -393,7 +422,7 @@ static void *gameLoop(void *arg) {
         gTick++;
         int stillRunning = gRunning;
         pthread_mutex_unlock(&gStateMutex);
-        Sleep(TICK_MS);
+        usleep(TICK_MS * 1000);
         if (!stillRunning) break;
     }
     return NULL;
@@ -401,7 +430,7 @@ static void *gameLoop(void *arg) {
 
 int main(void) {
     srand((unsigned int)time(NULL));
-    gConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    enableRawInput();
     initMap();
     initHero();
     initTowers();
