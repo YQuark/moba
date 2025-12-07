@@ -1,12 +1,68 @@
+#ifndef _WIN32
+#define _XOPEN_SOURCE 700
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <conio.h>
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+
+typedef HANDLE pthread_t;
+typedef CRITICAL_SECTION pthread_mutex_t;
+typedef DWORD WINAPI thread_return_t;
+
+static int pthread_mutex_init(pthread_mutex_t *m, void *attr) {
+    (void)attr;
+    InitializeCriticalSection(m);
+    return 0;
+}
+
+static int pthread_mutex_destroy(pthread_mutex_t *m) {
+    DeleteCriticalSection(m);
+    return 0;
+}
+
+static int pthread_mutex_lock(pthread_mutex_t *m) {
+    EnterCriticalSection(m);
+    return 0;
+}
+
+static int pthread_mutex_unlock(pthread_mutex_t *m) {
+    LeaveCriticalSection(m);
+    return 0;
+}
+
+static int pthread_create(pthread_t *thread, void *attr, thread_return_t (*start_routine)(void *), void *arg) {
+    (void)attr;
+    *thread = CreateThread(NULL, 0, start_routine, arg, 0, NULL);
+    return *thread ? 0 : -1;
+}
+
+static int pthread_join(pthread_t thread, void *retval) {
+    (void)retval;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    return 0;
+}
+
+static void restoreTerminal(void) {}
+static void enableRawInput(void) {}
+
+#else
+#include <unistd.h>
 #include <termios.h>
 #include <sys/select.h>
-#include <time.h>
-#include <unistd.h>
+typedef void *thread_return_t;
+#endif
 
 #define MAP_W 50
 #define MAP_H 20
@@ -58,9 +114,16 @@ static Minion gMinions[MAX_MINIONS];
 static Tower gTowers[2];
 static int gRunning = 1;
 static int gTick = 0;
+#ifdef _WIN32
+static pthread_mutex_t gStateMutex;
+#else
 pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+#ifndef _WIN32
 static struct termios gOrigTermios;
+#endif
 
+#ifndef _WIN32
 static void restoreTerminal(void) {
     tcsetattr(STDIN_FILENO, TCSANOW, &gOrigTermios);
 }
@@ -75,6 +138,7 @@ static void enableRawInput(void) {
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     atexit(restoreTerminal);
 }
+#endif
 
 static void initMap(void) {
     for (int y = 0; y < MAP_H; ++y) {
@@ -141,6 +205,17 @@ static void initMinions(void) {
     for (int i = 0; i < MAX_MINIONS; ++i) {
         gMinions[i].alive = 0;
     }
+}
+
+static void sleepMilliseconds(int ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
 }
 
 static int isWalkable(int x, int y) {
@@ -356,8 +431,37 @@ static void renderFrame(void) {
     printf("Controls: WASD move, SPACE stop, J attack, Q quit\n");
 }
 
-static void *inputThread(void *arg) {
+static thread_return_t inputThread(void *arg) {
     (void)arg;
+#ifdef _WIN32
+    while (1) {
+        if (_kbhit()) {
+            int ch = _getch();
+            pthread_mutex_lock(&gStateMutex);
+            if (!gRunning) {
+                pthread_mutex_unlock(&gStateMutex);
+                break;
+            }
+            switch (ch) {
+                case 'w': case 'W': gHero.dirX = 0; gHero.dirY = -1; break;
+                case 's': case 'S': gHero.dirX = 0; gHero.dirY = 1; break;
+                case 'a': case 'A': gHero.dirX = -1; gHero.dirY = 0; break;
+                case 'd': case 'D': gHero.dirX = 1; gHero.dirY = 0; break;
+                case ' ': gHero.dirX = 0; gHero.dirY = 0; break;
+                case 'j': case 'J': gHero.attackRequested = 1; break;
+                case 'q': case 'Q': gRunning = 0; break;
+                default: break;
+            }
+            pthread_mutex_unlock(&gStateMutex);
+            if (ch == 'q' || ch == 'Q') break;
+        }
+        pthread_mutex_lock(&gStateMutex);
+        int stillRunning = gRunning;
+        pthread_mutex_unlock(&gStateMutex);
+        if (!stillRunning) break;
+        Sleep(100);
+    }
+#else
     while (1) {
         fd_set set;
         struct timeval tv;
@@ -392,7 +496,8 @@ static void *inputThread(void *arg) {
         pthread_mutex_unlock(&gStateMutex);
         if (ch == 'q' || ch == 'Q') break;
     }
-    return NULL;
+#endif
+    return 0;
 }
 
 static void gameTick(void) {
@@ -405,7 +510,7 @@ static void gameTick(void) {
     handleDeathsAndXP();
 }
 
-static void *gameLoop(void *arg) {
+static thread_return_t gameLoop(void *arg) {
     (void)arg;
     while (1) {
         pthread_mutex_lock(&gStateMutex);
@@ -422,14 +527,17 @@ static void *gameLoop(void *arg) {
         gTick++;
         int stillRunning = gRunning;
         pthread_mutex_unlock(&gStateMutex);
-        usleep(TICK_MS * 1000);
+        sleepMilliseconds(TICK_MS);
         if (!stillRunning) break;
     }
-    return NULL;
+    return 0;
 }
 
 int main(void) {
     srand((unsigned int)time(NULL));
+#ifdef _WIN32
+    pthread_mutex_init(&gStateMutex, NULL);
+#endif
     enableRawInput();
     initMap();
     initHero();
@@ -449,6 +557,9 @@ int main(void) {
     pthread_mutex_lock(&gStateMutex);
     int result = checkVictory();
     pthread_mutex_unlock(&gStateMutex);
+#ifdef _WIN32
+    pthread_mutex_destroy(&gStateMutex);
+#endif
     if (result > 0) {
         printf("You Win!\n");
     } else if (result < 0) {
