@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <pthread.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -61,6 +60,7 @@ static void enableRawInput(void) {}
 #include <unistd.h>
 #include <termios.h>
 #include <sys/select.h>
+#include <pthread.h>
 typedef void *thread_return_t;
 #endif
 
